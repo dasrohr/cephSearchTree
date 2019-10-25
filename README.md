@@ -11,7 +11,8 @@ needs to be executed on the admin-node.
 note that NOT everything in this programm is tailored to work out-of-the box with every cluster setup.
 some things are hard-coded to OUR needs. Feel free to adjust things to fit your needs.
 
-```Usage:
+```
+Usage:
   cephSearchTree osd <osd>...
   
   cephSearchTree pg <pg>...
