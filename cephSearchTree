@@ -1,0 +1,218 @@
+#!/usr/bin/env python
+
+"""
+written by Toni Warnecke - University Medicine Essen
+
+program to make some informations from ceph more eye-friendly or easiert to access.
+program was created 'on-demand' - no real developemt process was involved. so might be a bit hacky and probably not realy optimized.
+program does NOT change anything on your cluster. but there is no warranty though.
+
+needs to be executed on the admin-node.
+
+note that NOT everything in this programm is tailored to work out-of-the box with every cluster setup.
+some things are hard-coded to OUR needs. Feel free to adjust things to fit your needs.
+
+Usage:
+  cephSearchTree osd <osd>...
+  cephSearchTree pg <pg>...
+  cephSearchTree placement
+  cephSearchTree -h | --help
+  cephSearchTree --version
+Options:
+  -h --help   show this help
+  --version   show version
+"""
+
+from sys import stdout
+from json import loads
+from os import popen
+from docopt import docopt
+
+osdTree = False
+pgDump = False
+
+def getPGDump():
+  # grap a full pgDump
+  global pgDump
+  pgDump = loads(popen("ceph pg dump --format json").read())
+
+def getOSDTree():
+  # grab the osd Tree
+  global osdTree
+  osdTree = loads(popen("ceph osd tree --format json").read())
+
+def getHostType(name):
+  # get the type of host
+  # in our setup we have 3 dcs, seperated with 3 namespaces (men, women, animals)
+  # strings in touples are hostnames.
+  # TODO: grab hostnames and dcs' dynamicly from osd Tree
+  frauen = ('gundula', 'berta', 'analia', 'oelgard', 'euphrosyne', 'gosia', 'jasmin')
+  herren = ('hieronymus', 'achim', 'carl', 'gottlieb', 'hugo', 'leonhard', 'peter', 'usain')
+  animal = ('borkenkaefer', 'hirsch', 'mollymawk', 'sailfish', 'uhu', 'fuchs', 'cassowary')
+
+  if name.startswith(frauen):
+    return 'frau'
+  elif name.startswith(herren):
+    return 'herr'
+  elif name.startswith(animal):
+    return 'tier'
+  else:
+    return 'bad'
+
+def getOSDHost(osd):
+  # find the hostname, a given osd number is running on.
+  # search in osd Tree
+  if not osdTree:
+    getOSDTree()
+
+  for host in osdTree["nodes"]:
+    if host["type"] == "host":
+      if osd in host["children"]:
+        return host["name"]
+  return ''
+
+def searchPG(pg):
+  # search for a given PG in pgDump
+  # TODO: it is not actually neccessary to store the dump in a variable.
+  #       running it and looping over the output should be more efficient in terms of memory consumption
+  if not pgDump:
+    getPGDump()
+  found = {}
+  found["pg"] = pg
+  # loop over the dump
+  for pgCurrent in pgDump["pg_map"]["pg_stats"]:
+    # is this our pg?
+    if pgCurrent["pgid"] == pg:
+      # store acting and primary osds if true
+      found["pri"] = pgCurrent["up_primary"]
+      found["act"] = pgCurrent["acting"]
+      # and exit after that
+      return found
+  # pg 404
+  found["pri"] = False
+  return found
+
+if __name__ == '__main__':
+  # docopt
+  arguments = docopt(__doc__, version='cephSearchTree 1.0')
+  # these are our host-types / namespaces
+  # the values are counting the amount of osds, running in each dc
+  #  to make the distribution of a pg accross the dcs' visable/more eye friendly
+  # bad means, no namespace found
+  # TODO: should grab those dynamicly from osd Tree
+  osdHostTypes = {
+    'herr': 0,
+    'frau': 0,
+    'tier': 0,
+    'bad': 0
+  }
+
+  if arguments["osd"]:
+    # search the host name of one or more osd
+    for arg in arguments["<osd>"]:
+      # repeat for every osd, given as argument, seperated by space or comma
+      for osd in str(arg).split(','):
+        if osd == "NONE":
+          # if you paste the placement of a pg from ceph health detail for example, 
+          #   there might be the string 'NONE' in the list, indicating a missing placement
+          osd = -1 
+        # find the hostname the osd is running on
+        osdHost = getOSDHost( int(osd) )
+        # get the namecpace, that hostname is in
+        osdHostType = getHostType( osdHost )
+        # count up the total hosts in namespace
+        osdHostTypes[osdHostType] = osdHostTypes[osdHostType] + 1
+        print("{:4} => {}").format( osd, osdHost )
+
+      # print namespace counters
+      for t, n in osdHostTypes.items():
+        print('{} = {}'.format(t,n))
+
+  if arguments["pg"]:
+    # search for a pg
+    res = []
+    for arg in arguments["<pg>"]:
+      # searching for multiple pgs at once is possible
+      for pg in str(arg).split(','):
+        res.append(searchPG(pg))
+    for result in res:
+      if not result["pri"]:
+        # if there is no primary osd, something might be bunged up
+        print("{} - does not seems to be a PG").format(result["pg"])
+      else:
+        print("{}").format(result["pg"])
+        for actingPG in result["act"]:
+          pri = ''
+          if actingPG == 2147483647:
+            # this number represent a missing placement.
+            # replace it with -1 - basically to make is more eye friendly
+            actingPG = -1
+          if actingPG == result["pri"]:
+            # add a post-fix to the output if the osd is the primary osd for the pg
+            pri = '(PRIMARY)'
+          print("{:>3} {:4} => {} {}").format( "\_", actingPG, getOSDHost(actingPG), pri )
+
+  if arguments["placement"]:
+    # show placements
+    # only show placements that are not equaly distributed over our dcs'
+    # this definetly will not work in every cluster setup!
+    # I do see a chance to get this working dynamicly. But this would be a bit of an overkill for us now
+    #  as this works 'ok enough' for us
+    # TODO: storing every dump in a variable might not be neccessary
+    getPGDump()
+    allPGs = {}
+    for pg in pgDump["pg_map"]["pg_stats"]:
+      # this basicaly sorts out the data from the dump I need
+      # I see, that this is not neccessary - but was a help at the time writing this
+      pgID = str(pg['pgid'])
+      allPGs[pgID] = {}
+      allPGs[pgID]['osds'] = {}
+      allPGs[pgID]['osdPlacement'] = {
+        'herr': 0,
+        'frau': 0,
+        'tier': 0,
+        'bad': 0
+        }
+      allPGs[pgID]['badMappings'] = 0
+      for osdActing in pg['acting']:
+        # count the bad/missing mapping
+        if osdActing == 2147483647:
+          osdActing = -1
+          allPGs[pgID]['badMappings'] = allPGs[pgID]['badMappings'] + 1
+        allPGs[pgID]['osds'][osdActing] = {}
+        # get the hostname of all acting osds
+        allPGs[pgID]['osds'][osdActing]['name'] = getOSDHost(osdActing)
+        # get the namespace of that host
+        type = getHostType(allPGs[pgID]['osds'][osdActing]['name'])
+        allPGs[pgID]['osdPlacement'][type] = allPGs[pgID]['osdPlacement'][type] + 1
+
+      gotBadPlacement = False
+      placementHelper = 0
+      # check the results from the previous loop to show only pgs that have bad/missing mappings or where
+      #  the placement accross our dcs' is not equaly
+      # NOTE: as we expect all placement to be distributed equaly accross our dcs', any placement
+      #       where not all dcs' hold the same amount of pgs is considered as bad
+      for type in allPGs[pgID]['osdPlacement'].keys():
+        if ( type != 'bad' ):
+          if ( 
+            allPGs[pgID]['osdPlacement'][type] != placementHelper
+            ) and (
+              placementHelper == 0
+            ):
+            placementHelper = allPGs[pgID]['osdPlacement'][type]
+          elif (
+            allPGs[pgID]['osdPlacement'][type] != placementHelper
+            ):
+            gotBadPlacement = True
+
+      if gotBadPlacement:
+        stdout.write('{}\n  > '.format(pgID))
+        for osd in allPGs[pgID]['osds'].keys():
+          stdout.write('{} ({})\t'.format(osd,allPGs[pgID]['osds'][osd]['name']))
+        if allPGs[pgID]['badMappings'] >= 1:
+          stdout.write('\n    {} BAD MAPPINGS '.format(allPGs[pgID]['badMappings']))
+        for type in allPGs[pgID]['osdPlacement'].keys():
+          stdout.write('\n    {}={}\t'.format(type,allPGs[pgID]['osdPlacement'][type]))
+        print('\n')
+    
+    print('done')
